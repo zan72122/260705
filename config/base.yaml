@@ -1,0 +1,47 @@
+# 共通設定。全パラメータをここに一元化する(コードにマジックナンバーを書かない)
+# 過学習防止のため、探索するパラメータは粗いグリッドのみ(docs/theory.md の原則を参照)
+
+data:
+  # データ置き場(gitignore対象)
+  data_dir: "data"
+  # 足の間隔
+  interval: "1h"
+  # 取得する履歴日数
+  history_days: 730
+
+universe:
+  # 各リバランス時点での出来高上位N銘柄
+  top_n: 30
+  # 出来高ランキングに使う過去日数
+  volume_lookback_days: 30
+  # 上場からの最低経過日数(新規上場の異常な値動きを避ける)
+  min_listing_days: 90
+
+signal:
+  name: "momentum"
+  # モメンタムのルックバック(時間)。粗いグリッド候補: 24 / 72 / 168 / 720
+  lookback_hours: 168
+
+portfolio:
+  # 上位・下位それぞれ何割をロング/ショートするか。候補: 0.1 / 0.2 / 0.3
+  quantile: 0.2
+
+rebalance:
+  # リバランス間隔(時間)。候補: 1 / 8 / 24。既定はコストとの均衡で24h
+  frequency_hours: 24
+
+costs:
+  # taker手数料(片道、bps)。保守的にtaker前提
+  fee_bps: 5.0
+  # スリッページ(片道、bps)。固定モデル
+  slippage_bps: 5.0
+
+backtest:
+  # 初期資本(USDT)。レポート表示用
+  initial_capital: 10000
+  # データ末尾のこの比率をホールドアウトとして温存し、既定では使わない
+  holdout_fraction: 0.25
+  # ホールドアウトも含めて実行するか(最終検証時のみ true にする)
+  use_holdout: false
+  # βの基準銘柄
+  benchmark_symbol: "BTCUSDT"

@@ -1,0 +1,23 @@
+# 秘密情報(APIキー等)は絶対にコミットしない
+.env
+
+# 取得データ・バックテスト結果(再生成可能)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# ノートブック・エディタ
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# pytest
+.pytest_cache/
