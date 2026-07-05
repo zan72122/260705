@@ -1,0 +1,1993 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#060821">
+<title>ほしのかわ 「み」</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    position:fixed; inset:0; width:100%; height:100%;
+    overflow:hidden; overscroll-behavior:none;
+    background:#060821;
+    -webkit-user-select:none; user-select:none;
+    -webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent;
+    font-family:'Hiragino Maru Gothic ProN','Hiragino Sans','IPAGothic',sans-serif;
+  }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  #world { z-index:1; }
+  #fx    { z-index:2; }
+
+  /* ---- HUD ---- */
+  #hud { position:absolute; z-index:5; inset:0; pointer-events:none; }
+  .hudBtn {
+    position:absolute; pointer-events:auto;
+    width:52px; height:52px; border:none; border-radius:50%;
+    background:rgba(120,150,255,.10); color:#cfe0ff;
+    font-size:26px; line-height:52px; text-align:center;
+    opacity:.55; transition:opacity .3s, transform .1s;
+  }
+  .hudBtn:active { transform:scale(.9); opacity:.9; }
+  #soundBtn { top:calc(10px + env(safe-area-inset-top)); right:calc(10px + env(safe-area-inset-right)); }
+  #resetBtn { bottom:calc(10px + env(safe-area-inset-bottom)); left:calc(10px + env(safe-area-inset-left)); opacity:.28; font-size:22px; }
+
+  /* ---- ごほうびワードカード ---- */
+  #card {
+    position:absolute; z-index:4; left:50%; top:18%;
+    transform:translate(-50%,-50%) scale(0);
+    display:flex; flex-direction:column; align-items:center; gap:2px;
+    padding:18px 34px; border-radius:32px;
+    background:radial-gradient(ellipse at center, rgba(40,50,120,.92), rgba(15,18,60,.92));
+    box-shadow:0 0 40px 8px rgba(140,180,255,.45), inset 0 0 30px rgba(160,200,255,.25);
+    pointer-events:none;
+    transition:transform .45s cubic-bezier(.2,1.6,.4,1);
+  }
+  #card.show { transform:translate(-50%,-50%) scale(1); }
+  #cardEmoji { font-size:min(17vw,110px); line-height:1.15;
+    filter:drop-shadow(0 0 14px rgba(255,255,255,.55)); }
+  #cardWord { font-size:min(9vw,54px); font-weight:bold; color:#eaf2ff; letter-spacing:.08em;
+    white-space:nowrap; text-shadow:0 0 12px rgba(150,190,255,.9); }
+  #cardWord .mi { color:#ffd76a; text-shadow:0 0 16px rgba(255,200,80,.95); font-size:1.18em; }
+
+  @keyframes cardPop { 0%{transform:scale(.4)} 60%{transform:scale(1.12)} 100%{transform:scale(1)} }
+</style>
+</head>
+<body>
+<canvas id="world"></canvas>
+<canvas id="fx"></canvas>
+<div id="hud">
+  <button id="soundBtn" class="hudBtn" aria-label="おと">🔊</button>
+  <button id="resetBtn" class="hudBtn" aria-label="りせっと">☆</button>
+</div>
+<div id="card"><div id="cardEmoji"></div><div id="cardWord"></div></div>
+
+<script>
+'use strict';
+/* =====================================================================
+ *  ほしのかわ 「み」 — 遊ぶだけで ひらがな「み」の書き順を覚えるアプリ
+ *  依存ゼロ・単一ファイル。iPhone/iPad Safari(縦・横)向け。
+ *  構成: CONFIG / Geo / MI_STROKES / Screen / Input / Progress /
+ *        AudioEngine / Voice / Particles / River / Fish /
+ *        Tracer / Mascot / Rewards / Game / boot
+ * ===================================================================== */
+
+const QUERY = new URLSearchParams(location.search);
+const DEBUG = QUERY.has('d');
+const TESTMODE = QUERY.has('test');
+
+/* ---------------------------------------------------------------------
+ * CONFIG — 調整パラメータの集約
+ * ------------------------------------------------------------------- */
+const CONFIG = {
+  glyphScale: 0.78,        // 字マス = 画面短辺 × これ
+  glyphYBias: 0.46,        // 字マスの縦位置(0.5=中央, 小さいほど上)
+  tolRatio: 0.11,          // なぞり許容半径 = 短辺 × これ(4歳向け極太)
+  startRadiusFactor: 1.7,  // 始点判定はさらに甘く
+  lookAhead: 3,            // チェックポイント先読み数(速い指対策)
+  completeRatio: 0.82,     // 指離し時にここまで進んでいれば画完了
+  derailFactor: 2.1,       // 帯からこの倍率超で静かに自由描きへ降格
+  cpSpacingPx: 34,         // チェックポイント間隔(実画面px)
+  inviteDelay: 4.0,        // 無操作→マスコット誘い(秒)
+  demoAfterInvites: 3,     // 誘い無視この回数で手本
+  riverResetRounds: 3,     // 何周ごとに川を夜空へ還すか
+  maxParticles: 2600,
+  // インク進化テーブル(need=累計「み」完成回数)
+  inkLevels: [
+    { need:0,  hue:205, hue2:195, stars:false, rainbow:false, comet:false, fish:12, trailMul:1.0 },
+    { need:1,  hue:190, hue2:165, stars:false, rainbow:false, comet:false, fish:18, trailMul:1.25 },
+    { need:3,  hue:0,   hue2:0,   stars:false, rainbow:true,  comet:false, fish:24, trailMul:1.5 },
+    { need:7,  hue:0,   hue2:0,   stars:true,  rainbow:true,  comet:false, fish:32, trailMul:1.75 },
+    { need:12, hue:46,  hue2:36,  stars:true,  rainbow:true,  comet:true,  fish:40, trailMul:2.1 },
+  ],
+  // 「み」のつくことば(ごほうび)
+  words: [
+    { w:'みかん',   e:'🍊' },
+    { w:'みず',     e:'💧' },
+    { w:'みつばち', e:'🐝' },
+    { w:'みかづき', e:'🌙' },
+    { w:'みみずく', e:'🦉' },
+    { w:'みどり',   e:'🍀' },
+  ],
+};
+
+/* ---------------------------------------------------------------------
+ * Geo — 幾何ユーティリティ(Catmull-Rom → 等間隔ポリライン)
+ * ------------------------------------------------------------------- */
+const Geo = {
+  dist(ax, ay, bx, by) { const dx = ax - bx, dy = ay - by; return Math.hypot(dx, dy); },
+
+  // Catmull-Rom スプラインを細かくサンプリング
+  catmullRom(pts, segPer = 18) {
+    const out = [];
+    const P = i => pts[Math.max(0, Math.min(pts.length - 1, i))];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+      for (let j = 0; j < segPer; j++) {
+        const t = j / segPer, t2 = t * t, t3 = t2 * t;
+        out.push([
+          0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3),
+          0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3),
+        ]);
+      }
+    }
+    out.push([pts[pts.length - 1][0], pts[pts.length - 1][1]]);
+    return out;
+  },
+
+  // ポリラインを等間隔に再サンプリング
+  resample(poly, spacing) {
+    const out = [poly[0].slice()];
+    let acc = 0;
+    for (let i = 1; i < poly.length; i++) {
+      let [px, py] = poly[i - 1];
+      const [qx, qy] = poly[i];
+      let seg = Math.hypot(qx - px, qy - py);
+      while (acc + seg >= spacing) {
+        const need = spacing - acc;
+        const r = need / seg;
+        const nx = px + (qx - px) * r, ny = py + (qy - py) * r;
+        out.push([nx, ny]);
+        px = nx; py = ny;
+        seg -= need; acc = 0;
+      }
+      acc += seg;
+    }
+    const last = poly[poly.length - 1];
+    const tail = out[out.length - 1];
+    if (Math.hypot(last[0] - tail[0], last[1] - tail[1]) > spacing * 0.35) out.push(last.slice());
+    return out;
+  },
+
+  polylineLength(poly) {
+    let L = 0;
+    for (let i = 1; i < poly.length; i++) L += Math.hypot(poly[i][0] - poly[i-1][0], poly[i][1] - poly[i-1][1]);
+    return L;
+  },
+
+  // 弧長パラメータ t(0..1) の点を返す(cum: 累積長配列)
+  pointAt(poly, cum, t) {
+    const total = cum[cum.length - 1];
+    const target = Math.max(0, Math.min(1, t)) * total;
+    let lo = 0, hi = cum.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < target) lo = mid + 1; else hi = mid; }
+    const i = Math.max(1, lo);
+    const segLen = cum[i] - cum[i-1] || 1;
+    const r = (target - cum[i-1]) / segLen;
+    return [
+      poly[i-1][0] + (poly[i][0] - poly[i-1][0]) * r,
+      poly[i-1][1] + (poly[i][1] - poly[i-1][1]) * r,
+    ];
+  },
+
+  cumLengths(poly) {
+    const cum = [0];
+    for (let i = 1; i < poly.length; i++) cum.push(cum[i-1] + Math.hypot(poly[i][0]-poly[i-1][0], poly[i][1]-poly[i-1][1]));
+    return cum;
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * MI_STROKES — ひらがな「み」の字形データ(2画)
+ * 1000×1000 の正規化字マスで Catmull-Rom 制御点として定義。
+ * 教科書体を目標に ?d のフォントオーバーレイと重ねて調整済み。
+ *   1画目: 左上から よこ → 折れて 左下へ ながく おりる → ぐるんと結び → 右へ抜ける
+ *   2画目: 右上から 結びの尻尾を横切って 左下へ はらう
+ * ------------------------------------------------------------------- */
+const MI_STROKES = [
+  {
+    name: 'よこ、おりて、ぐるん',
+    points: [
+      [225,235],[400,200],[560,170],          // よこ(わずかに右上がり)
+      [500,330],[420,480],[345,615],          // ななめに左下へ
+      [290,665],[238,725],[218,800],          // 結びへ左まわりに入る
+      [268,880],[368,918],[458,860],          // 底をまわって右上へ
+      [512,775],[520,700],                    // 結びのてっぺん(線の太さで閉じて見える)
+      [650,662],[800,622],[930,588],          // 長い尻尾を右へ(すこし上がる)
+    ],
+  },
+  {
+    name: 'みぎうえから、はらい',
+    points: [
+      [734,105],[688,300],[636,520],          // 右上からゆるやかに下りる
+      [596,700],[540,900],                    // 尻尾を横切って左下へはらう
+    ],
+  },
+];
+
+/* ---------------------------------------------------------------------
+ * Screen — サイズ・DPR・回転・座標変換(正規化字マス ⇔ 画面px)
+ * ------------------------------------------------------------------- */
+const Screen = {
+  w: 0, h: 0, dpr: 1,
+  glyph: { scale: 1, ox: 0, oy: 0, size: 0 },
+  tol: 40,
+  worldC: null, fxC: null, world: null, fx: null,
+  _listeners: [],
+
+  init() {
+    this.worldC = document.getElementById('world');
+    this.fxC = document.getElementById('fx');
+    this.world = this.worldC.getContext('2d');
+    this.fx = this.fxC.getContext('2d');
+    const onR = () => this.resize();
+    window.addEventListener('resize', onR);
+    window.addEventListener('orientationchange', () => {
+      // iOSは回転直後 innerWidth/Height が古いことがある → 数フレーム後に再確認
+      setTimeout(onR, 60);
+      requestAnimationFrame(() => requestAnimationFrame(onR));
+      setTimeout(onR, 400);
+    });
+    this.resize();
+  },
+
+  onResize(fn) { this._listeners.push(fn); },
+
+  resize() {
+    const w = window.innerWidth, h = window.innerHeight;
+    if (!w || !h) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (w === this.w && h === this.h && dpr === this.dpr) return;
+    this.w = w; this.h = h; this.dpr = dpr;
+    for (const c of [this.worldC, this.fxC]) {
+      c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+    }
+    this.world.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.fx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const size = Math.min(w, h) * CONFIG.glyphScale;
+    this.glyph.size = size;
+    this.glyph.scale = size / 1000;
+    this.glyph.ox = (w - size) / 2;
+    this.glyph.oy = (h - size) * CONFIG.glyphYBias;
+    this.tol = Math.min(w, h) * CONFIG.tolRatio;
+    for (const fn of this._listeners) fn();
+  },
+
+  n2s(p) { return [this.glyph.ox + p[0] * this.glyph.scale, this.glyph.oy + p[1] * this.glyph.scale]; },
+  n2sPoly(poly) { return poly.map(p => this.n2s(p)); },
+};
+
+/* ---------------------------------------------------------------------
+ * Progress — localStorage 保存(プライベートブラウズ耐性)
+ * ------------------------------------------------------------------- */
+const Progress = {
+  KEY: 'hoshinokawa.v1',
+  data: null,
+
+  defaults() {
+    return { v: 1, completions: 0, inkLevel: 0, wordsHeard: [], lastPlayed: 0 };
+  },
+
+  load() {
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      const d = raw ? JSON.parse(raw) : null;
+      this.data = (d && d.v === 1) ? Object.assign(this.defaults(), d) : this.defaults();
+    } catch (e) { this.data = this.defaults(); }
+    return this.data;
+  },
+
+  save() {
+    this.data.lastPlayed = Date.now();
+    try { localStorage.setItem(this.KEY, JSON.stringify(this.data)); } catch (e) { /* private mode 等は黙って無視 */ }
+  },
+
+  reset() {
+    this.data = this.defaults();
+    try { localStorage.removeItem(this.KEY); } catch (e) {}
+  },
+
+  // 完成1回を記録し、進化したら新レベルを返す(しなければ -1)
+  addCompletion() {
+    this.data.completions++;
+    const lv = CONFIG.inkLevels.reduce((acc, L, i) => this.data.completions >= L.need ? i : acc, 0);
+    let evolved = -1;
+    if (lv > this.data.inkLevel) { this.data.inkLevel = lv; evolved = lv; }
+    this.save();
+    return evolved;
+  },
+
+  ink() { return CONFIG.inkLevels[Math.min(this.data.inkLevel, CONFIG.inkLevels.length - 1)]; },
+};
+
+/* ---------------------------------------------------------------------
+ * Input — Pointer Events 統合(なぞりはプライマリ1本、他の指も世界に反応)
+ * ------------------------------------------------------------------- */
+const Input = {
+  pointers: new Map(),   // id -> {x,y,px,py}
+  primaryId: null,
+
+  init() {
+    const opts = { passive: false };
+    const el = document.getElementById('fx');
+    el.addEventListener('pointerdown', e => this._down(e), opts);
+    el.addEventListener('pointermove', e => this._move(e), opts);
+    el.addEventListener('pointerup', e => this._up(e), opts);
+    el.addEventListener('pointercancel', e => this._up(e), opts);
+    // 古いiOS保険: スクロール/ズームの芽を全部摘む
+    document.addEventListener('touchmove', e => e.preventDefault(), opts);
+    document.addEventListener('gesturestart', e => e.preventDefault(), opts);
+    document.addEventListener('dblclick', e => e.preventDefault(), opts);
+  },
+
+  _down(e) {
+    e.preventDefault();
+    try { e.target.setPointerCapture(e.pointerId); } catch (err) {}
+    const p = { x: e.clientX, y: e.clientY, px: e.clientX, py: e.clientY };
+    this.pointers.set(e.pointerId, p);
+    const isPrimary = this.primaryId === null;
+    if (isPrimary) this.primaryId = e.pointerId;
+    Game.onDown(p.x, p.y, isPrimary);
+  },
+
+  _move(e) {
+    const p = this.pointers.get(e.pointerId);
+    if (!p) return;
+    e.preventDefault();
+    // iOS Safari は getCoalescedEvents 対応 → なめらかな軌跡のため利用
+    const evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+    for (const ev of evs) {
+      p.px = p.x; p.py = p.y;
+      p.x = ev.clientX; p.y = ev.clientY;
+      Game.onMove(p.x, p.y, p.px, p.py, e.pointerId === this.primaryId);
+    }
+  },
+
+  _up(e) {
+    const p = this.pointers.get(e.pointerId);
+    if (!p) return;
+    this.pointers.delete(e.pointerId);
+    const wasPrimary = e.pointerId === this.primaryId;
+    if (wasPrimary) this.primaryId = null;
+    Game.onUp(p.x, p.y, wasPrimary);
+  },
+
+  primaryPos() {
+    if (this.primaryId === null) return null;
+    const p = this.pointers.get(this.primaryId);
+    return p ? [p.x, p.y] : null;
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * AudioEngine — 全て WebAudio 合成(音声素材ゼロ)
+ *   キラキラ音 / なぞり追従音(進捗で音程が上がる=誘導装置) /
+ *   水音 / ファンファーレ / 進化音 / アンビエントパッド
+ * ------------------------------------------------------------------- */
+const AudioEngine = {
+  ctx: null, master: null, muted: false, unlocked: false,
+  _noiseBuf: null, _sparkleVoices: 0, _trace: null, _pad: null,
+  // ペンタトニック(ラ抜きの明るい音階)を2オクターブ
+  SCALE: [523.25, 587.33, 659.25, 783.99, 880.0, 1046.5, 1174.7, 1318.5, 1568.0, 1760.0],
+
+  ensure() {
+    if (this.ctx) return true;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.9;
+    this.master.connect(this.ctx.destination);
+    // ノイズバッファ(水音・シンバル用)を一度だけ生成
+    const len = this.ctx.sampleRate;
+    this._noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const ch = this._noiseBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+    return true;
+  },
+
+  // iOS: 初回タッチで resume + 無音再生。TTS も空発話でアンロック
+  unlock() {
+    if (!this.ensure()) return;
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    const buf = this.ctx.createBuffer(1, 1, 22050);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf; src.connect(this.master); src.start(0);
+    this.unlocked = true;
+    this._startPad();
+    Voice.unlock();
+  },
+
+  setMuted(m) {
+    this.muted = m;
+    if (this.master) this.master.gain.setTargetAtTime(m ? 0 : 0.9, this.ctx.currentTime, 0.05);
+    if (m) Voice.cancel();
+  },
+
+  suspend() { if (this.ctx && this.ctx.state === 'running') this.ctx.suspend(); },
+  resume()  { if (this.ctx && this.unlocked && this.ctx.state === 'suspended') this.ctx.resume(); },
+
+  _env(gain, t0, a, peak, d) {
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(Math.max(peak, 0.0002), t0 + a);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + a + d);
+  },
+
+  // ---- キラキラ(星屑)。intensity 0..1
+  sparkle(intensity = 0.5) {
+    if (!this.ctx || this.muted || this._sparkleVoices >= 8) return;
+    this._sparkleVoices++;
+    const t = this.ctx.currentTime;
+    const note = this.SCALE[(Math.random() * this.SCALE.length) | 0] * 2;
+    const g = this.ctx.createGain();
+    this._env(g, t, 0.008, 0.05 + 0.1 * intensity, 0.28);
+    g.connect(this.master);
+    const o1 = this.ctx.createOscillator(), o2 = this.ctx.createOscillator();
+    o1.type = 'sine'; o2.type = 'sine';
+    o1.frequency.value = note; o2.frequency.value = note * 1.008; // 微デチューンで煌めき
+    o1.connect(g); o2.connect(g);
+    o1.start(t); o2.start(t);
+    o1.stop(t + 0.32); o2.stop(t + 0.32);
+    o1.onended = () => { this._sparkleVoices--; };
+  },
+
+  // ---- 水音(波紋)
+  water() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this._noiseBuf;
+    src.playbackRate.value = 0.7 + Math.random() * 0.5;
+    const bp = this.ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 380 + Math.random() * 520;
+    bp.Q.value = 2.2;
+    const g = this.ctx.createGain();
+    this._env(g, t, 0.02, 0.16, 0.3);
+    src.connect(bp); bp.connect(g); g.connect(this.master);
+    src.start(t, Math.random() * 0.4); src.stop(t + 0.4);
+  },
+
+  // ---- なぞり追従音: 常設オシレータ。進捗率で音程が上がる
+  traceStart() {
+    if (!this.ctx || this.muted) return;
+    this.traceStop(true);
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type = 'triangle';
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 900; lp.Q.value = 1.2;
+    const vib = this.ctx.createOscillator(); vib.frequency.value = 6;
+    const vibG = this.ctx.createGain(); vibG.gain.value = 4;
+    vib.connect(vibG); vibG.connect(o.frequency);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.09, t + 0.08);
+    o.connect(lp); lp.connect(g); g.connect(this.master);
+    o.frequency.value = this.SCALE[0];
+    o.start(t); vib.start(t);
+    this._trace = { o, g, lp, vib, vibG, lastStep: -1 };
+  },
+
+  // progress 0..1, speed px/frame
+  traceUpdate(progress, speed) {
+    const tr = this._trace;
+    if (!tr) return;
+    const t = this.ctx.currentTime;
+    const step = Math.min(this.SCALE.length - 1, Math.floor(progress * this.SCALE.length));
+    const f = this.SCALE[step];
+    tr.o.frequency.setTargetAtTime(f, t, 0.04);
+    tr.lp.frequency.setTargetAtTime(700 + Math.min(speed, 40) * 60, t, 0.06);
+    tr.vibG.gain.setTargetAtTime(2 + Math.min(speed, 30) * 0.3, t, 0.1);
+    if (step > tr.lastStep) {           // 一段上がるごとに小さなキラン
+      tr.lastStep = step;
+      this.sparkle(0.35);
+    }
+  },
+
+  traceStop(hard = false) {
+    const tr = this._trace;
+    if (!tr) return;
+    this._trace = null;
+    const t = this.ctx.currentTime;
+    tr.g.gain.cancelScheduledValues(t);
+    tr.g.gain.setTargetAtTime(0.0001, t, hard ? 0.01 : 0.08);
+    tr.o.stop(t + 0.5); tr.vib.stop(t + 0.5);
+  },
+
+  _tone(freq, t0, dur, peak, type = 'triangle') {
+    const o = this.ctx.createOscillator();
+    o.type = type; o.frequency.value = freq;
+    const g = this.ctx.createGain();
+    this._env(g, t0, 0.015, peak, dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t0); o.stop(t0 + dur + 0.1);
+  },
+
+  // ---- 画完了: 小ファンファーレ(3和音アルペジオ)
+  fanfareSmall() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    [523.25, 659.25, 783.99].forEach((f, i) => this._tone(f, t + i * 0.09, 0.5, 0.14));
+  },
+
+  // ---- 「み」完成: 大ファンファーレ+シンバル
+  fanfareBig() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    const seq = [523.25, 659.25, 783.99, 1046.5, 783.99, 1046.5, 1318.5, 1568.0];
+    seq.forEach((f, i) => {
+      this._tone(f, t + i * 0.11, 0.5, 0.15);
+      this._tone(f / 2, t + i * 0.11, 0.5, 0.08, 'sine');
+    });
+    // シンバル的ノイズバースト
+    const src = this.ctx.createBufferSource();
+    src.buffer = this._noiseBuf;
+    const hp = this.ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 5200;
+    const g = this.ctx.createGain();
+    this._env(g, t + 0.02, 0.01, 0.2, 1.1);
+    src.connect(hp); hp.connect(g); g.connect(this.master);
+    src.start(t); src.stop(t + 1.2);
+  },
+
+  // ---- インク進化: 上昇グリッサンド
+  levelUp() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(392, t);
+    o.frequency.exponentialRampToValueAtTime(1568, t + 0.7);
+    const g = this.ctx.createGain();
+    this._env(g, t, 0.03, 0.16, 0.85);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + 1);
+    for (let i = 0; i < 6; i++) setTimeout(() => this.sparkle(0.9), 700 + i * 90);
+  },
+
+  // ---- 誘いチャイム(押し付けない小さな音)
+  chime() {
+    if (!this.ctx || this.muted) return;
+    const t = this.ctx.currentTime;
+    this._tone(1046.5, t, 0.35, 0.06, 'sine');
+    this._tone(1318.5, t + 0.12, 0.4, 0.05, 'sine');
+  },
+
+  // ---- アンビエントパッド(ごく小さな持続音で夜の空気感)
+  _startPad() {
+    if (this._pad || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.028, t + 4);
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 420;
+    const o1 = this.ctx.createOscillator(), o2 = this.ctx.createOscillator();
+    o1.type = 'sine'; o2.type = 'sine';
+    o1.frequency.value = 130.81; o2.frequency.value = 196.0;  // C3 + G3
+    const lfo = this.ctx.createOscillator(); lfo.frequency.value = 0.07;
+    const lfoG = this.ctx.createGain(); lfoG.gain.value = 60;
+    lfo.connect(lfoG); lfoG.connect(lp.frequency);
+    o1.connect(lp); o2.connect(lp); lp.connect(g); g.connect(this.master);
+    o1.start(t); o2.start(t); lfo.start(t);
+    this._pad = { o1, o2, lfo, g };
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Voice — speechSynthesis ja-JP(常に「冗長チャネル」。無くても成立)
+ * ------------------------------------------------------------------- */
+const Voice = {
+  voice: null, ready: false, enabled: !TESTMODE,
+  _queue: [], _speaking: false,
+
+  init() {
+    if (!('speechSynthesis' in window)) { this.enabled = false; return; }
+    const pick = () => {
+      const vs = speechSynthesis.getVoices();
+      if (!vs.length) return false;
+      this.voice = vs.find(v => v.lang && v.lang.replace('_','-').toLowerCase().startsWith('ja')) || null;
+      this.ready = true;
+      return true;
+    };
+    if (!pick()) {
+      speechSynthesis.addEventListener('voiceschanged', pick);
+      let tries = 0;
+      const iv = setInterval(() => { if (pick() || ++tries > 10) clearInterval(iv); }, 300);
+    }
+  },
+
+  unlock() {
+    if (!this.enabled || !('speechSynthesis' in window)) return;
+    try {
+      const u = new SpeechSynthesisUtterance('');
+      u.volume = 0;
+      speechSynthesis.speak(u);
+    } catch (e) {}
+  },
+
+  say(text, { interrupt = false } = {}) {
+    if (!this.enabled || AudioEngine.muted || !('speechSynthesis' in window)) return;
+    if (interrupt) this.cancel();
+    this._queue.push(text);
+    this._pump();
+  },
+
+  _pump() {
+    if (this._speaking || !this._queue.length) return;
+    const text = this._queue.shift();
+    try {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP';
+      if (this.voice) u.voice = this.voice;
+      u.rate = 0.92; u.pitch = 1.25; u.volume = 1;
+      this._speaking = true;
+      u.onend = u.onerror = () => { this._speaking = false; this._pump(); };
+      speechSynthesis.speak(u);
+      // onend が来ない環境の保険
+      setTimeout(() => { if (this._speaking) { this._speaking = false; this._pump(); } }, 6000);
+    } catch (e) { this._speaking = false; }
+  },
+
+  cancel() {
+    this._queue.length = 0;
+    this._speaking = false;
+    try { speechSynthesis.cancel(); } catch (e) {}
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Particles — 固定長プール(GC回避)。glow は shadowBlur を使わず
+ * 低アルファ円の重ね描き(iOS Safari で軽い)
+ *   type: dust=星屑 / ripple=波紋 / ink=なぞりインク / star5=星形 /
+ *         shoot=流れ星 / burst=花火 / sub=昇華(インクが星になる)
+ * ------------------------------------------------------------------- */
+const Particles = {
+  pool: [], free: [], budget: 1,
+
+  init() {
+    for (let i = 0; i < CONFIG.maxParticles; i++) {
+      const p = { on:false, type:0, x:0, y:0, vx:0, vy:0, life:0, max:1, size:2, hue:200, sat:90, lit:70, spin:0, rot:0 };
+      this.pool.push(p); this.free.push(p);
+    }
+  },
+
+  spawn(type, x, y, opt = {}) {
+    if (!this.free.length) return null;
+    if (this.budget < 1 && Math.random() > this.budget) return null; // 負荷時は生成を確率で絞る
+    const p = this.free.pop();
+    p.on = true; p.type = type; p.x = x; p.y = y;
+    p.vx = opt.vx || 0; p.vy = opt.vy || 0;
+    p.max = opt.life || 1; p.life = p.max;
+    p.size = opt.size || 3;
+    p.hue = opt.hue !== undefined ? opt.hue : 205;
+    p.sat = opt.sat !== undefined ? opt.sat : 95;
+    p.lit = opt.lit !== undefined ? opt.lit : 72;
+    p.spin = opt.spin || 0; p.rot = opt.rot || Math.random() * 6.28;
+    return p;
+  },
+
+  // 星屑をまき散らす(自由描きの基本反応)
+  dust(x, y, n, hue, spread = 2.2) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * 6.283, sp = Math.random() * spread;
+      this.spawn(1, x, y, {
+        vx: Math.cos(a) * sp * 60, vy: Math.sin(a) * sp * 60 - 25,
+        life: 0.5 + Math.random() * 0.9,
+        size: 1.2 + Math.random() * 2.6,
+        hue: hue + (Math.random() * 40 - 20),
+      });
+    }
+  },
+
+  ripple(x, y, hue) {
+    this.spawn(2, x, y, { life: 0.9, size: 6, hue });
+  },
+
+  ink(x, y, hue, sizeMul = 1) {
+    this.spawn(3, x, y, {
+      vx: (Math.random() - 0.5) * 6, vy: (Math.random() - 0.5) * 6,
+      life: 0.8 + Math.random() * 0.7,
+      size: (2.5 + Math.random() * 4) * sizeMul, hue,
+    });
+  },
+
+  star5(x, y, hue) {
+    this.spawn(4, x, y, {
+      vx: (Math.random() - 0.5) * 30, vy: (Math.random() - 0.5) * 30 - 12,
+      life: 1 + Math.random(), size: 4 + Math.random() * 5,
+      hue, spin: (Math.random() - 0.5) * 5,
+    });
+  },
+
+  shoot(x, y, angle, hue = 48) {
+    const sp = 520 + Math.random() * 260;
+    this.spawn(5, x, y, {
+      vx: Math.cos(angle) * sp, vy: Math.sin(angle) * sp,
+      life: 0.9 + Math.random() * 0.5, size: 2.6 + Math.random() * 1.6, hue, sat: 85, lit: 78,
+    });
+  },
+
+  burst(x, y, n, hue, power = 240) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * 6.283, sp = (0.25 + Math.random() * 0.75) * power;
+      this.spawn(6, x, y, {
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: 0.8 + Math.random() * 0.9, size: 1.6 + Math.random() * 2.8,
+        hue: hue + (Math.random() * 30 - 15),
+      });
+    }
+  },
+
+  sublimate(x, y, hue) {
+    this.spawn(7, x, y, {
+      vx: (Math.random() - 0.5) * 26, vy: -30 - Math.random() * 55,
+      life: 1.3 + Math.random() * 1.2, size: 2 + Math.random() * 3, hue,
+    });
+  },
+
+  update(dt) {
+    for (const p of this.pool) {
+      if (!p.on) continue;
+      p.life -= dt;
+      if (p.life <= 0) { p.on = false; this.free.push(p); continue; }
+      switch (p.type) {
+        case 1: // dust: ふわっと減速しつつ上へ
+          p.vx *= (1 - 1.8 * dt); p.vy = p.vy * (1 - 1.8 * dt) - 14 * dt;
+          p.x += p.vx * dt; p.y += p.vy * dt; break;
+        case 2: break; // ripple: 位置固定で拡大は描画側
+        case 3: // ink: ほぼその場でゆらめく
+          p.x += p.vx * dt; p.y += p.vy * dt; break;
+        case 4: // star5
+          p.vy += 16 * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.spin * dt; break;
+        case 5: // shoot: 直進+わずかに重力
+          p.vy += 60 * dt; p.x += p.vx * dt; p.y += p.vy * dt; break;
+        case 6: // burst: 花火(重力+空気抵抗)
+          p.vx *= (1 - 1.1 * dt); p.vy = p.vy * (1 - 1.1 * dt) + 150 * dt;
+          p.x += p.vx * dt; p.y += p.vy * dt; break;
+        case 7: // sub: 星へ昇る
+          p.x += p.vx * dt + Math.sin(p.life * 7 + p.rot) * 18 * dt;
+          p.y += p.vy * dt; break;
+      }
+    }
+  },
+
+  render(ctx) {
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of this.pool) {
+      if (!p.on) continue;
+      const k = p.life / p.max;               // 1→0
+      const a = k < 0.75 ? k / 0.75 : 1;
+      switch (p.type) {
+        case 2: { // 波紋
+          const r = p.size + (1 - k) * 90;
+          ctx.strokeStyle = `hsla(${p.hue},90%,75%,${0.45 * k})`;
+          ctx.lineWidth = 2.5 * k + 0.5;
+          ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 6.283); ctx.stroke();
+          ctx.strokeStyle = `hsla(${p.hue},90%,85%,${0.2 * k})`;
+          ctx.lineWidth = 7 * k + 1;
+          ctx.beginPath(); ctx.arc(p.x, p.y, r * 0.72, 0, 6.283); ctx.stroke();
+          break;
+        }
+        case 4: { // 星形
+          ctx.save();
+          ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+          ctx.fillStyle = `hsla(${p.hue},95%,80%,${a})`;
+          this._starPath(ctx, p.size);
+          ctx.fill();
+          ctx.restore();
+          break;
+        }
+        case 5: { // 流れ星: 尾を線で
+          const tx = p.x - p.vx * 0.13, ty = p.y - p.vy * 0.13;
+          const grad = ctx.createLinearGradient(p.x, p.y, tx, ty);
+          grad.addColorStop(0, `hsla(${p.hue},95%,85%,${a})`);
+          grad.addColorStop(1, `hsla(${p.hue},95%,70%,0)`);
+          ctx.strokeStyle = grad; ctx.lineWidth = p.size; ctx.lineCap = 'round';
+          ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(tx, ty); ctx.stroke();
+          ctx.fillStyle = `hsla(${p.hue},100%,92%,${a})`;
+          ctx.beginPath(); ctx.arc(p.x, p.y, p.size * 0.9, 0, 6.283); ctx.fill();
+          break;
+        }
+        default: { // 丸い光(glowは低アルファ大円の重ね)
+          ctx.fillStyle = `hsla(${p.hue},${p.sat}%,${p.lit}%,${0.13 * a})`;
+          ctx.beginPath(); ctx.arc(p.x, p.y, p.size * 2.6, 0, 6.283); ctx.fill();
+          ctx.fillStyle = `hsla(${p.hue},${p.sat}%,${Math.min(p.lit + 18, 96)}%,${0.85 * a})`;
+          ctx.beginPath(); ctx.arc(p.x, p.y, p.size * k, 0, 6.283); ctx.fill();
+        }
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  },
+
+  _starPath(ctx, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rr = i % 2 === 0 ? r : r * 0.45;
+      const a = (i / 10) * 6.283 - Math.PI / 2;
+      const x = Math.cos(a) * rr, y = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * River — 完成した画が「光の川」として定着する
+ * 正規化ポリラインを保持し、回転・リサイズ時は再投影のみ
+ * ------------------------------------------------------------------- */
+const River = {
+  rivers: [],   // {strokeIndex, polyN, poly, cum, len, born, level}
+  fading: false, fadeT: 0,
+
+  init() { Screen.onResize(() => this.reproject()); },
+
+  add(strokeIndex, polyN, level) {
+    this.rivers = this.rivers.filter(r => r.strokeIndex !== strokeIndex); // 同じ画は置き換え
+    const poly = Screen.n2sPoly(polyN);
+    const cum = Geo.cumLengths(poly);
+    this.rivers.push({ strokeIndex, polyN, poly, cum, len: cum[cum.length-1], born: Game.now, level });
+    this.rivers.sort((a, b) => a.strokeIndex - b.strokeIndex);
+  },
+
+  reproject() {
+    for (const r of this.rivers) {
+      r.poly = Screen.n2sPoly(r.polyN);
+      r.cum = Geo.cumLengths(r.poly);
+      r.len = r.cum[r.cum.length-1];
+    }
+  },
+
+  clear() { this.rivers.length = 0; this.fading = false; },
+
+  // 夜空へ還す(昇華パーティクルを軌跡に沿って出しながら消す)
+  fadeOut() { if (this.rivers.length) { this.fading = true; this.fadeT = 0; } },
+
+  count() { return this.rivers.length; },
+
+  update(dt) {
+    if (this.fading) {
+      this.fadeT += dt;
+      for (const r of this.rivers) {
+        for (let i = 0; i < 3; i++) {
+          const [x, y] = Geo.pointAt(r.poly, r.cum, Math.random());
+          Particles.sublimate(x, y, this._hueAt(r, Math.random()));
+        }
+      }
+      if (this.fadeT > 2.2) { this.clear(); }
+    }
+  },
+
+  _hueAt(r, t) {
+    const ink = CONFIG.inkLevels[r.level];
+    if (ink.rainbow) return (t * 300 + Game.now * 30) % 360;
+    return ink.hue;
+  },
+
+  render(ctx) {
+    const fade = this.fading ? Math.max(0, 1 - this.fadeT / 2.2) : 1;
+    for (const r of this.rivers) {
+      const ink = CONFIG.inkLevels[r.level];
+      const age = Math.min(1, (Game.now - r.born) / 0.6); // 定着アニメ
+      const alpha = age * fade;
+      const w = Screen.tol * 0.5;
+      ctx.save();
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.globalCompositeOperation = 'lighter';
+      // 外側グロー → コア の3層
+      this._strokePath(ctx, r, w * 1.9, 0.10 * alpha, ink, 14);
+      this._strokePath(ctx, r, w * 1.0, 0.22 * alpha, ink, 26);
+      this._strokePath(ctx, r, w * 0.34, 0.85 * alpha, ink, 42);
+      // 流れる光(川面のきらめき)
+      const flows = 4 + r.level * 2;
+      for (let i = 0; i < flows; i++) {
+        const t = ((Game.now * (0.10 + 0.02 * (i % 3)) + i / flows) % 1);
+        const [x, y] = Geo.pointAt(r.poly, r.cum, t);
+        const hue = this._hueAt(r, t);
+        ctx.fillStyle = `hsla(${hue},95%,88%,${0.5 * alpha})`;
+        ctx.beginPath(); ctx.arc(x, y, 3.2, 0, 6.283); ctx.fill();
+        ctx.fillStyle = `hsla(${hue},95%,80%,${0.14 * alpha})`;
+        ctx.beginPath(); ctx.arc(x, y, 9, 0, 6.283); ctx.fill();
+      }
+      // 星入りインク: 川面に小さな星
+      if (ink.stars && Math.random() < 0.25) {
+        const [x, y] = Geo.pointAt(r.poly, r.cum, Math.random());
+        Particles.star5(x, y, 48);
+      }
+      ctx.restore();
+    }
+  },
+
+  _strokePath(ctx, r, width, alpha, ink, litBase) {
+    ctx.lineWidth = width;
+    if (ink.rainbow) {
+      // 虹色: 区間ごとに色相を変えて分割ストローク
+      const SEG = 14;
+      for (let s = 0; s < SEG; s++) {
+        const t0 = s / SEG, t1 = (s + 1) / SEG;
+        const hue = (t0 * 300 + Game.now * 30) % 360;
+        ctx.strokeStyle = `hsla(${hue},90%,${44 + litBase}%,${alpha})`;
+        ctx.beginPath();
+        const steps = 6;
+        for (let k = 0; k <= steps; k++) {
+          const [x, y] = Geo.pointAt(r.poly, r.cum, t0 + (t1 - t0) * (k / steps));
+          if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    } else {
+      ctx.strokeStyle = `hsla(${ink.hue},92%,${40 + litBase}%,${alpha})`;
+      ctx.beginPath();
+      for (let i = 0; i < r.poly.length; i++) {
+        const [x, y] = r.poly[i];
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Fish — boid の光る魚。指を追い、川に沿って泳ぎ、大群泳する
+ * ------------------------------------------------------------------- */
+const Fish = {
+  list: [], mode: 'wander', paradeT: 0,
+
+  init(n) { this.setCount(n); },
+
+  setCount(n) {
+    while (this.list.length < n) {
+      this.list.push({
+        x: Math.random() * Screen.w, y: Math.random() * Screen.h,
+        vx: (Math.random() - 0.5) * 40, vy: (Math.random() - 0.5) * 40,
+        phase: Math.random() * 6.283,
+        hue: 180 + Math.random() * 70,
+        size: 5 + Math.random() * 5,
+        t: Math.random(),               // 川に沿う位置
+      });
+    }
+    if (this.list.length > n) this.list.length = n;
+  },
+
+  startParade() { this.mode = 'parade'; this.paradeT = 0; },
+  endParade() { this.mode = 'wander'; },
+
+  update(dt) {
+    const fingers = [...Input.pointers.values()];
+    const finger = fingers.length ? fingers[0] : null;
+    if (this.mode === 'parade') this.paradeT += dt;
+
+    const n = this.list.length;
+    for (let i = 0; i < n; i++) {
+      const f = this.list[i];
+      f.phase += dt * (5 + Math.hypot(f.vx, f.vy) * 0.04);
+
+      // ---- boid 3則(少数なので O(n²) で十分)
+      let sx = 0, sy = 0, ax = 0, ay = 0, cx = 0, cy = 0, cnt = 0;
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const o = this.list[j];
+        const dx = o.x - f.x, dy = o.y - f.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < 6400) {                 // 80px 以内
+          cnt++;
+          cx += o.x; cy += o.y;
+          ax += o.vx; ay += o.vy;
+          if (d2 < 900) { sx -= dx; sy -= dy; }   // 30px 以内は離れる
+        }
+      }
+      if (cnt) {
+        f.vx += ((cx / cnt - f.x) * 0.6 + (ax / cnt - f.vx) * 0.8 + sx * 3.2) * dt;
+        f.vy += ((cy / cnt - f.y) * 0.6 + (ay / cnt - f.vy) * 0.8 + sy * 3.2) * dt;
+      }
+
+      // ---- アトラクタ
+      let tx = null, ty = null, pull = 1;
+      if (this.mode === 'parade' && River.count()) {
+        // 大群泳: 全部の川を高速で流れる
+        const r = River.rivers[i % River.count()];
+        f.t = (f.t + dt * (0.55 + (i % 5) * 0.05)) % 1;
+        [tx, ty] = Geo.pointAt(r.poly, r.cum, f.t);
+        pull = 7;
+      } else if (Game.sub === 'tracing' && Tracer.inkPoints.length > 4) {
+        // なぞり中: 指先ではなく描かれたインクの軌跡に沿って隊列で泳ぐ
+        const pts = Tracer.inkPoints;
+        const back = 5 * ((i % 8) + 2);
+        const p = pts[Math.max(0, pts.length - 1 - back)];
+        tx = p[0]; ty = p[1]; pull = 2.2;
+      } else if (finger && Game.state === 'play') {
+        // 指を追いかける(先頭集団ほど強く)
+        tx = finger.x; ty = finger.y; pull = 2.6 + (i % 7) * 0.25;
+      } else if (River.count()) {
+        // 川に沿ってゆったり泳ぐ
+        const r = River.rivers[i % River.count()];
+        f.t = (f.t + dt * (0.05 + (i % 4) * 0.012)) % 1;
+        [tx, ty] = Geo.pointAt(r.poly, r.cum, f.t);
+        pull = 2.2;
+      } else {
+        // 漂う: 画面中央めがけてゆるく
+        tx = Screen.w / 2 + Math.cos(Game.now * 0.3 + i) * Screen.w * 0.3;
+        ty = Screen.h / 2 + Math.sin(Game.now * 0.23 + i * 1.7) * Screen.h * 0.28;
+        pull = 0.5;
+      }
+      if (tx !== null) {
+        const dx = tx - f.x, dy = ty - f.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const sp = Math.min(d, 320);
+        f.vx += (dx / d) * sp * pull * dt;
+        f.vy += (dy / d) * sp * pull * dt;
+      }
+
+      // ---- 速度制限・減衰・移動
+      const spd = Math.hypot(f.vx, f.vy);
+      const maxSp = this.mode === 'parade' ? 620 : 300;
+      if (spd > maxSp) { f.vx = f.vx / spd * maxSp; f.vy = f.vy / spd * maxSp; }
+      f.vx *= (1 - 0.55 * dt); f.vy *= (1 - 0.55 * dt);
+      f.x += f.vx * dt; f.y += f.vy * dt;
+
+      // 画面外に出すぎたら反対側から
+      const m = 60;
+      if (f.x < -m) f.x = Screen.w + m; if (f.x > Screen.w + m) f.x = -m;
+      if (f.y < -m) f.y = Screen.h + m; if (f.y > Screen.h + m) f.y = -m;
+
+      // 泳ぎの軌跡がほんのり光る
+      if (Math.random() < (this.mode === 'parade' ? 0.5 : 0.06)) {
+        Particles.spawn(1, f.x, f.y, {
+          vx: -f.vx * 0.05, vy: -f.vy * 0.05,
+          life: 0.5, size: 1.5, hue: f.hue,
+        });
+      }
+    }
+  },
+
+  render(ctx) {
+    ctx.globalCompositeOperation = 'lighter';
+    for (const f of this.list) {
+      const ang = Math.atan2(f.vy, f.vx);
+      const wag = Math.sin(f.phase) * 0.5;
+      ctx.save();
+      ctx.translate(f.x, f.y);
+      ctx.rotate(ang);
+      // グロー
+      ctx.fillStyle = `hsla(${f.hue},90%,70%,0.10)`;
+      ctx.beginPath(); ctx.arc(0, 0, f.size * 2.0, 0, 6.283); ctx.fill();
+      // 体(しずく形)
+      ctx.fillStyle = `hsla(${f.hue},85%,82%,0.95)`;
+      ctx.beginPath();
+      ctx.moveTo(f.size, 0);
+      ctx.quadraticCurveTo(0, -f.size * 0.75, -f.size * 0.9, wag * f.size * 0.4);
+      ctx.quadraticCurveTo(0, f.size * 0.75, f.size, 0);
+      ctx.fill();
+      // 尾びれ
+      ctx.fillStyle = `hsla(${f.hue},85%,75%,0.7)`;
+      ctx.beginPath();
+      ctx.moveTo(-f.size * 0.8, wag * f.size * 0.3);
+      ctx.lineTo(-f.size * 1.7, wag * f.size + f.size * 0.55);
+      ctx.lineTo(-f.size * 1.7, wag * f.size - f.size * 0.55);
+      ctx.closePath(); ctx.fill();
+      // 目
+      ctx.fillStyle = 'rgba(20,30,60,0.9)';
+      ctx.beginPath(); ctx.arc(f.size * 0.45, -f.size * 0.16, f.size * 0.14, 0, 6.283); ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Tracer — なぞり判定(チェックポイント逐次消化・順序付き・罰ゼロ)
+ *   ・始点の近くでタッチ → なぞり開始。それ以外は自由描き
+ *   ・cp[k+1..k+lookAhead] に入ったら前進(逆走は「進まないだけ」)
+ *   ・帯から大きく離れたら静かに自由描きへ降格
+ *   ・指離し時 progress >= completeRatio で画完了
+ * ------------------------------------------------------------------- */
+const Tracer = {
+  strokesN: [],     // 正規化・等間隔ポリライン(判定/描画/手本の共通ソース)
+  strokes: [],      // 画面座標 {poly, cps, cum}
+  strokeIndex: 0,
+  tracing: false,
+  k: 0,
+  inkPoints: [],    // 今なぞっている軌跡(昇華演出用)
+
+  init() {
+    // Catmull-Rom → 密ポリライン → 正規化1000空間で等間隔(8単位)に
+    this.strokesN = MI_STROKES.map(s => Geo.resample(Geo.catmullRom(s.points, 24), 8));
+    Screen.onResize(() => this.reproject());
+    this.reproject();
+  },
+
+  reproject() {
+    this.strokes = this.strokesN.map(polyN => {
+      const poly = Screen.n2sPoly(polyN);
+      const cps = Geo.resample(poly, CONFIG.cpSpacingPx);
+      return { poly, cps, cum: Geo.cumLengths(poly) };
+    });
+  },
+
+  current() { return this.strokes[this.strokeIndex]; },
+  startPoint() { const s = this.current(); return s ? s.cps[0] : null; },
+  done() { return this.strokeIndex >= this.strokes.length; },
+  progress() {
+    const s = this.current();
+    return s ? this.k / (s.cps.length - 1) : 0;
+  },
+  // マスコットが先導する位置(少し先のチェックポイント)
+  cheerPoint() {
+    const s = this.current();
+    if (!s) return null;
+    return s.cps[Math.min(this.k + 3, s.cps.length - 1)];
+  },
+
+  tryStart(x, y) {
+    if (this.done() || this.tracing) return false;
+    const sp = this.startPoint();
+    if (Geo.dist(x, y, sp[0], sp[1]) <= Screen.tol * CONFIG.startRadiusFactor) {
+      this.tracing = true;
+      this.k = 0;
+      this.inkPoints.length = 0;
+      this.inkPoints.push([x, y]);
+      return true;
+    }
+    return false;
+  },
+
+  // 戻り値: 'advance' | 'stay' | 'derail'
+  move(x, y) {
+    if (!this.tracing) return 'stay';
+    const s = this.current();
+    const n = s.cps.length;
+    this.inkPoints.push([x, y]);
+    if (this.inkPoints.length > 220) this.inkPoints.shift();
+
+    let advanced = false;
+    for (let j = Math.min(this.k + CONFIG.lookAhead, n - 1); j > this.k; j--) {
+      const cp = s.cps[j];
+      if (Geo.dist(x, y, cp[0], cp[1]) <= Screen.tol) { this.k = j; advanced = true; break; }
+    }
+
+    // 脱線チェック: 現在位置が近傍チェックポイント帯からどれだけ離れているか
+    let minD = Infinity;
+    const lo = Math.max(0, this.k - 2), hi = Math.min(n - 1, this.k + CONFIG.lookAhead + 1);
+    for (let j = lo; j <= hi; j++) {
+      const d = Geo.dist(x, y, s.cps[j][0], s.cps[j][1]);
+      if (d < minD) minD = d;
+    }
+    if (minD > Screen.tol * CONFIG.derailFactor) {
+      this.tracing = false;
+      return 'derail';
+    }
+    return advanced ? 'advance' : 'stay';
+  },
+
+  // 指を離した。戻り値: 'complete' | 'incomplete'
+  end() {
+    if (!this.tracing) return 'incomplete';
+    this.tracing = false;
+    if (this.progress() >= CONFIG.completeRatio) {
+      const idx = this.strokeIndex;
+      this.strokeIndex++;
+      this.k = 0;
+      return 'complete';
+    }
+    return 'incomplete';
+  },
+
+  restart() { this.strokeIndex = 0; this.k = 0; this.tracing = false; this.inkPoints.length = 0; },
+
+  // なぞり中のインク位置(音・エフェクトの中心)
+  inkHue(progressT) {
+    const ink = Progress.ink();
+    if (ink.rainbow) return (progressT * 300 + Game.now * 40) % 360;
+    return ink.hue + (ink.hue2 - ink.hue) * progressT;
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Mascot — 光の精霊「みぃ」状態機械
+ * IDLE → INVITE(始点で跳ねる) → DEMO(手本) / CHEER(先導) /
+ * REJOICE(大喜び) / COMFORT(脱線時いっしょに遊ぶ)
+ * ------------------------------------------------------------------- */
+const Mascot = {
+  x: 0, y: 0, vx: 0, vy: 0,
+  state: 'idle', t: 0,
+  demoT: 0, demoTrail: [],     // 手本の残像 [{x,y,age}]
+  invitesIgnored: 0,
+  blink: 0, squash: 1,
+  bubble: 0,                   // REJOICE の飛び跳ね用
+
+  init() { this.x = Screen.w / 2; this.y = Screen.h * 0.3; },
+
+  set(state) {
+    if (this.state === state) return;
+    this.state = state;
+    this.t = 0;
+    if (state === 'demo') { this.demoT = 0; }
+  },
+
+  update(dt) {
+    this.t += dt;
+    this.blink -= dt;
+    if (this.blink < -3 - Math.random() * 2) this.blink = 0.12;
+
+    let tx = this.x, ty = this.y, ease = 3;
+
+    switch (this.state) {
+      case 'idle': {
+        // ふわふわ漂いつつ、指があれば少し興味を示す
+        const fp = Input.primaryPos();
+        const bx = Screen.w * 0.5 + Math.cos(Game.now * 0.5) * Screen.w * 0.22;
+        const by = Screen.h * 0.24 + Math.sin(Game.now * 0.7) * Screen.h * 0.06;
+        if (fp) { tx = bx * 0.7 + fp[0] * 0.3; ty = by * 0.7 + fp[1] * 0.3; }
+        else { tx = bx; ty = by; }
+        break;
+      }
+      case 'invite': {
+        // 始点の上でぴょんぴょん
+        const sp = Tracer.startPoint();
+        if (sp) {
+          const hop = Math.abs(Math.sin(this.t * 4.2));
+          tx = sp[0]; ty = sp[1] - Screen.tol * 0.9 - hop * 26;
+          ease = 5;
+        }
+        break;
+      }
+      case 'demo': {
+        // 手本: 現在の画のポリラインを等速再生(終盤すこし加速)
+        const s = Tracer.current();
+        if (!s) { this.set('idle'); break; }
+        const dur = TESTMODE ? 0.8 : 2.6;
+        this.demoT += dt / dur * (1 + this.demoT * 0.35);
+        if (this.demoT >= 1) {
+          this.demoT = 1;
+          if (this.t > (TESTMODE ? 1 : 3.4)) this.set('invite');
+        }
+        const [dx, dy] = Geo.pointAt(s.poly, s.cum, Math.min(this.demoT, 1));
+        tx = dx; ty = dy; ease = 14;
+        this.demoTrail.push({ x: dx, y: dy, age: 0 });
+        break;
+      }
+      case 'cheer': {
+        const cp = Tracer.cheerPoint();
+        if (cp) { tx = cp[0]; ty = cp[1] - Screen.tol * 0.55; ease = 8; }
+        break;
+      }
+      case 'rejoice': {
+        // バク宙しながら跳ねまわる
+        this.bubble += dt * 7;
+        tx = Screen.w * 0.5 + Math.cos(this.bubble) * Screen.w * 0.2;
+        ty = Screen.h * 0.3 + Math.sin(this.bubble * 1.7) * Screen.h * 0.1 - 30;
+        ease = 4;
+        if (Math.random() < 0.3) Particles.dust(this.x, this.y, 2, 48, 1.5);
+        if (this.t > (TESTMODE ? 0.8 : 3)) this.set('idle');
+        break;
+      }
+      case 'comfort': {
+        // 指のそばに来て一緒に星屑を出す
+        const fp = Input.primaryPos();
+        if (fp) { tx = fp[0] + 40; ty = fp[1] - 40; ease = 6; }
+        if (Math.random() < 0.4) Particles.dust(this.x, this.y, 1, 200, 1.2);
+        if (this.t > 2) { this.set('invite'); }
+        break;
+      }
+    }
+
+    this.vx += (tx - this.x) * ease * dt;
+    this.vy += (ty - this.y) * ease * dt;
+    this.vx *= (1 - 4 * dt); this.vy *= (1 - 4 * dt);
+    this.x += this.vx * dt * 8; this.y += this.vy * dt * 8;
+    const spd = Math.hypot(this.vx, this.vy);
+    this.squash = 1 + Math.min(spd / 400, 0.35);
+
+    // 手本残像のエイジング
+    for (const g of this.demoTrail) g.age += dt;
+    while (this.demoTrail.length && this.demoTrail[0].age > 6) this.demoTrail.shift();
+
+    // 精霊の尾の光
+    if (Math.random() < 0.5) {
+      Particles.spawn(1, this.x, this.y + 6, {
+        vx: -this.vx * 0.15, vy: -this.vy * 0.15 + 8,
+        life: 0.6, size: 1.6, hue: 52, sat: 90, lit: 80,
+      });
+    }
+  },
+
+  render(ctx) {
+    // ---- 手本の残像(正解パスがうっすら見える)
+    if (this.demoTrail.length > 1) {
+      ctx.save();
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      let started = false;
+      for (const g of this.demoTrail) {
+        if (!started) { ctx.moveTo(g.x, g.y); started = true; }
+        else ctx.lineTo(g.x, g.y);
+      }
+      const a = Math.max(0, 1 - this.demoTrail[0].age / 6) * 0.4;
+      ctx.strokeStyle = `hsla(52,95%,78%,${a})`;
+      ctx.lineWidth = 5;
+      ctx.setLineDash([2, 14]);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    const R = Math.max(14, Screen.tol * 0.42);
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    const ang = Math.atan2(this.vy, this.vx);
+    ctx.rotate(Math.sin(Game.now * 2) * 0.06);
+    ctx.scale(this.squash, 2 - this.squash);
+
+    // グロー(多層)
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'hsla(52,95%,75%,0.10)';
+    ctx.beginPath(); ctx.arc(0, 0, R * 2.8, 0, 6.283); ctx.fill();
+    ctx.fillStyle = 'hsla(52,95%,80%,0.22)';
+    ctx.beginPath(); ctx.arc(0, 0, R * 1.7, 0, 6.283); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+
+    // 本体
+    const grad = ctx.createRadialGradient(-R*0.25, -R*0.3, R*0.1, 0, 0, R);
+    grad.addColorStop(0, '#fffbe8');
+    grad.addColorStop(0.55, '#ffe98f');
+    grad.addColorStop(1, '#ffc94d');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(0, 0, R, 0, 6.283); ctx.fill();
+
+    // ほっぺ
+    ctx.fillStyle = 'rgba(255,150,120,0.5)';
+    ctx.beginPath(); ctx.arc(-R*0.52, R*0.18, R*0.16, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc( R*0.52, R*0.18, R*0.16, 0, 6.283); ctx.fill();
+
+    // 目(まばたき・喜び目)
+    ctx.fillStyle = '#333a55';
+    const happy = this.state === 'rejoice' || this.state === 'cheer';
+    for (const sgn of [-1, 1]) {
+      const ex = sgn * R * 0.32, ey = -R * 0.12;
+      if (this.blink > 0 || (happy && this.state === 'rejoice')) {
+        ctx.strokeStyle = '#333a55'; ctx.lineWidth = R * 0.09; ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.arc(ex, ey + R*0.05, R * 0.16, Math.PI * 1.15, Math.PI * 1.85);
+        ctx.stroke();
+      } else {
+        ctx.beginPath(); ctx.arc(ex, ey, R * 0.13, 0, 6.283); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(ex + R*0.04, ey - R*0.05, R * 0.045, 0, 6.283); ctx.fill();
+        ctx.fillStyle = '#333a55';
+      }
+    }
+    // くち
+    ctx.strokeStyle = '#333a55'; ctx.lineWidth = R * 0.07; ctx.lineCap = 'round';
+    ctx.beginPath();
+    if (happy) ctx.arc(0, R * 0.2, R * 0.22, Math.PI * 0.15, Math.PI * 0.85);
+    else ctx.arc(0, R * 0.28, R * 0.12, Math.PI * 0.2, Math.PI * 0.8);
+    ctx.stroke();
+
+    ctx.restore();
+
+    // INVITE 中: 始点にパルスリング
+    if (this.state === 'invite' || this.state === 'demo') {
+      const sp = Tracer.startPoint();
+      if (sp) {
+        const pulse = (Game.now * 1.1) % 1;
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.strokeStyle = `hsla(52,95%,75%,${0.55 * (1 - pulse)})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(sp[0], sp[1], Screen.tol * (0.4 + pulse * 0.9), 0, 6.283); ctx.stroke();
+        ctx.fillStyle = 'hsla(52,95%,85%,0.75)';
+        ctx.beginPath(); ctx.arc(sp[0], sp[1], 7 + Math.sin(Game.now * 5) * 2.5, 0, 6.283); ctx.fill();
+        ctx.restore();
+      }
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Rewards — 成功演出シーケンサ+「み」のつくことばカード
+ * ------------------------------------------------------------------- */
+const Rewards = {
+  events: [], t: 0, active: false, endAt: 0,
+  cardEl: null, cardEmoji: null, cardWord: null, _cardTimer: 0,
+
+  init() {
+    this.cardEl = document.getElementById('card');
+    this.cardEmoji = document.getElementById('cardEmoji');
+    this.cardWord = document.getElementById('cardWord');
+  },
+
+  // 「み」完成の大演出タイムライン
+  celebrate(evolvedLv) {
+    const S = TESTMODE ? 0.18 : 1;      // テスト時は短縮
+    this.events = [];
+    this.t = 0; this.active = true;
+    const push = (at, fn) => this.events.push({ at: at * S, fn, done: false });
+
+    push(0, () => {
+      AudioEngine.fanfareBig();
+      Fish.startParade();
+      Mascot.set('rejoice');
+      Voice.say('できたー! ひらがなの「み」!');
+      this._glyphFlash(1.0);
+    });
+    push(0.5, () => this._fireworkOnGlyph(3));
+    push(1.1, () => this._fireworkOnGlyph(4));
+    push(1.7, () => {
+      this._shootingStars(4);
+      this._fireworkOnGlyph(3);
+    });
+    push(2.3, () => this.showWord());
+    push(3.6, () => this._shootingStars(3));
+    if (evolvedLv >= 0) {
+      push(4.6, () => {
+        AudioEngine.levelUp();
+        Voice.say('インクが しんかした!');
+        this._inkShower(evolvedLv);
+      });
+    }
+    push(5.6, () => this.hideWord());
+    this.endAt = (evolvedLv >= 0 ? 6.8 : 6.2) * S;
+  },
+
+  update(dt) {
+    if (!this.active) return;
+    this.t += dt;
+    for (const e of this.events) {
+      if (!e.done && this.t >= e.at) { e.done = true; e.fn(); }
+    }
+    if (this.t >= this.endAt) {
+      this.active = false;
+      this.hideWord();
+      Game.endCelebration();
+    }
+  },
+
+  // 「み」全体が一斉に光る
+  _glyphFlash(strength) {
+    for (const s of Tracer.strokes) {
+      const n = Math.floor(30 * strength);
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        const [x, y] = Geo.pointAt(s.poly, s.cum, t);
+        Particles.dust(x, y, 2, Tracer.inkHue(t), 2.6);
+        if (Progress.ink().stars && i % 4 === 0) Particles.star5(x, y, 48);
+      }
+    }
+  },
+
+  // 字の上のランダム地点で花火
+  _fireworkOnGlyph(count) {
+    for (let i = 0; i < count; i++) {
+      const s = Tracer.strokes[(Math.random() * Tracer.strokes.length) | 0];
+      const [x, y] = Geo.pointAt(s.poly, s.cum, Math.random());
+      const hue = Progress.ink().rainbow ? Math.random() * 360 : Progress.ink().hue;
+      Particles.burst(x, y, 46, hue, 260);
+      if (!AudioEngine.muted) setTimeout(() => AudioEngine.water(), i * 120);
+    }
+  },
+
+  _shootingStars(count) {
+    for (let i = 0; i < count; i++) {
+      const fromLeft = Math.random() < 0.5;
+      const x = fromLeft ? -20 : Screen.w * (0.3 + Math.random() * 0.7);
+      const y = Screen.h * Math.random() * 0.35;
+      const ang = fromLeft ? 0.5 + Math.random() * 0.3 : 2.3 + Math.random() * 0.3;
+      Particles.shoot(x, y, ang);
+      AudioEngine.sparkle(0.8);
+    }
+  },
+
+  // 進化: 新しい色のインクが空から降ってくる
+  _inkShower(lv) {
+    const ink = CONFIG.inkLevels[lv];
+    const cx = Screen.w / 2;
+    for (let i = 0; i < 60; i++) {
+      const hue = ink.rainbow ? Math.random() * 360 : ink.hue;
+      Particles.spawn(1, cx + (Math.random() - 0.5) * Screen.w * 0.7, -10 - Math.random() * 80, {
+        vx: (Math.random() - 0.5) * 40, vy: 120 + Math.random() * 160,
+        life: 1.6 + Math.random(), size: 2 + Math.random() * 3.5, hue,
+      });
+      if (ink.stars && i % 5 === 0) Particles.star5(cx + (Math.random() - 0.5) * Screen.w * 0.6, Math.random() * Screen.h * 0.3, 48);
+    }
+  },
+
+  // ---- ことばカード
+  showWord() {
+    const heard = Progress.data.wordsHeard;
+    const fresh = CONFIG.words.filter(w => !heard.includes(w.w));
+    const pick = (fresh.length ? fresh : CONFIG.words)[(Math.random() * (fresh.length ? fresh.length : CONFIG.words.length)) | 0];
+    if (!heard.includes(pick.w)) { heard.push(pick.w); Progress.save(); }
+    this.cardEmoji.textContent = pick.e;
+    this.cardWord.innerHTML = pick.w.split('').map((ch, i) =>
+      i === 0 ? `<span class="mi">${ch}</span>` : ch).join('');
+    this.cardEl.classList.add('show');
+    Voice.say(`${pick.w}の 「み」!`);
+  },
+
+  hideWord() { this.cardEl.classList.remove('show'); },
+};
+
+/* ---------------------------------------------------------------------
+ * Game — 全体制御(BOOT → PLAY、FreePlay と TraceFSM の並行)
+ * ------------------------------------------------------------------- */
+const Game = {
+  state: 'boot',           // boot | play
+  sub: 'idle',             // idle | tracing | celebrate
+  now: 0,
+  idleTimer: 0,
+  invitesIgnored: 0,
+  firstInviteSaid: false,
+  rounds: 0,
+  stars: [],               // 背景の星
+  _lastInkPt: null,
+  _moveAcc: 0,
+  _running: true,
+
+  init() {
+    this.makeStars();
+    Screen.onResize(() => this.makeStars());
+  },
+
+  makeStars() {
+    this.stars = [];
+    const n = Math.floor((Screen.w * Screen.h) / 9000);
+    for (let i = 0; i < n; i++) {
+      this.stars.push({
+        x: Math.random() * Screen.w, y: Math.random() * Screen.h,
+        r: 0.5 + Math.random() * 1.7,
+        ph: Math.random() * 6.283, sp: 0.4 + Math.random() * 1.6,
+        warm: Math.random() < 0.2,
+      });
+    }
+  },
+
+  /* ================= 入力 ================= */
+  onDown(x, y, isPrimary) {
+    if (this.state === 'boot') {
+      this.state = 'play';
+      AudioEngine.unlock();
+      AudioEngine.fanfareSmall();
+      Particles.burst(x, y, 40, 52, 300);
+      Voice.say('ほしのかわへ ようこそ!');
+      this.idleTimer = CONFIG.inviteDelay - 1.2;  // すぐ誘いに来る
+      return;
+    }
+    this.idleTimer = 0;
+
+    if (this.sub === 'celebrate') {
+      Particles.dust(x, y, 8, 52); Particles.ripple(x, y, 52);
+      return;
+    }
+
+    if (isPrimary && this.sub === 'idle' && Tracer.tryStart(x, y)) {
+      this.sub = 'tracing';
+      this.invitesIgnored = 0;
+      this._lastInkPt = [x, y];
+      AudioEngine.traceStart();
+      AudioEngine.sparkle(0.6);
+      Mascot.set('cheer');
+      Particles.ripple(x, y, Tracer.inkHue(0));
+      return;
+    }
+
+    // ---- 自由描き: 触れた瞬間から世界が応える
+    const hue = 190 + Math.random() * 60;
+    Particles.dust(x, y, 10, hue);
+    Particles.ripple(x, y, hue);
+    AudioEngine.water();
+    AudioEngine.sparkle(0.4);
+  },
+
+  onMove(x, y, px, py, isPrimary) {
+    if (this.state === 'boot') return;
+    const dist = Geo.dist(x, y, px, py);
+
+    if (this.sub === 'tracing' && isPrimary) {
+      const res = Tracer.move(x, y);
+      const prog = Tracer.progress();
+      const ink = Progress.ink();
+      // インクの光を軌跡に沿って置く
+      this._moveAcc += dist;
+      const step = 7;
+      while (this._moveAcc >= step) {
+        this._moveAcc -= step;
+        const hue = Tracer.inkHue(prog);
+        Particles.ink(x, y, hue, ink.trailMul);
+        if (ink.stars && Math.random() < 0.2) Particles.star5(x, y, 48);
+        if (ink.comet && Math.random() < 0.4) {
+          Particles.spawn(1, x, y, { vx: (px - x) * 3, vy: (py - y) * 3, life: 1.1, size: 2.5, hue: 46 });
+        }
+      }
+      AudioEngine.traceUpdate(prog, dist);
+      if (res === 'derail') this._onDerail(x, y);
+      return;
+    }
+
+    // ---- 自由描き: 指の動きに星屑が湧き続ける(連続変化の快感)
+    if (dist > 2) {
+      const hue = (this.now * 40 + x * 0.15) % 360;
+      const n = Math.min(4, Math.ceil(dist / 14));
+      for (let i = 0; i < n; i++) {
+        const t = i / n;
+        Particles.spawn(1, px + (x - px) * t, py + (y - py) * t, {
+          vx: (Math.random() - 0.5) * 50, vy: (Math.random() - 0.5) * 50 - 20,
+          life: 0.5 + Math.random() * 0.7, size: 1.3 + Math.random() * 2.4, hue,
+        });
+      }
+      if (Math.random() < 0.05) AudioEngine.sparkle(0.25);
+      if (Math.random() < 0.02) Particles.ripple(x, y, hue);
+    }
+  },
+
+  onUp(x, y, isPrimary) {
+    if (this.state !== 'play') return;
+    if (this.sub === 'tracing' && isPrimary) {
+      const res = Tracer.end();
+      AudioEngine.traceStop();
+      if (res === 'complete') this._onStrokeComplete();
+      else this._onIncomplete();
+    }
+  },
+
+  /* ================= TraceFSM イベント ================= */
+  _onDerail(x, y) {
+    // 罰なし: インクは星屑になって、そのまま自由描きへ
+    AudioEngine.traceStop();
+    this._sublimateInk();
+    this.sub = 'idle';
+    Mascot.set('comfort');
+  },
+
+  _onIncomplete() {
+    this.sub = 'idle';
+    const prog = Tracer.progress();
+    this._sublimateInk();
+    Tracer.k = 0;
+    if (prog > 0.25) Mascot.set('comfort');
+    else Mascot.set('idle');
+  },
+
+  _sublimateInk() {
+    const pts = Tracer.inkPoints;
+    for (let i = 0; i < pts.length; i += 3) {
+      Particles.sublimate(pts[i][0], pts[i][1], 205);
+    }
+    pts.length = 0;
+  },
+
+  _onStrokeComplete() {
+    const doneIdx = Tracer.strokeIndex - 1;
+    River.add(doneIdx, Tracer.strokesN[doneIdx], Progress.data.inkLevel);
+    Tracer.inkPoints.length = 0;
+    AudioEngine.fanfareSmall();
+
+    if (Tracer.done()) {
+      this._celebrate();
+    } else {
+      this.sub = 'idle';
+      Mascot.set('invite');           // すぐ次の画の始点へ誘う
+      const lines = ['じょうず!', 'すごい!', 'そのちょうし!'];
+      Voice.say(lines[(Math.random() * lines.length) | 0]);
+      const sp = Tracer.startPoint();
+      if (sp) Particles.dust(sp[0], sp[1], 6, 52);
+    }
+  },
+
+  _celebrate() {
+    this.sub = 'celebrate';
+    const evolved = Progress.addCompletion();
+    Rewards.celebrate(evolved);
+  },
+
+  endCelebration() {
+    this.sub = 'idle';
+    Fish.endParade();
+    Fish.setCount(Progress.ink().fish);
+    Tracer.restart();
+    this.rounds++;
+    if (this.rounds % CONFIG.riverResetRounds === 0) {
+      River.fadeOut();
+      Voice.say('ほしぞらに かえっていくよ。またかこう!');
+    }
+    this.idleTimer = 0;
+    Mascot.set('idle');
+  },
+
+  /* ================= 更新 ================= */
+  update(dt) {
+    this.now += dt;
+    if (this.state !== 'play') return;
+
+    Particles.update(dt);
+    River.update(dt);
+    Fish.update(dt);
+    Mascot.update(dt);
+    Rewards.update(dt);
+
+    // ---- 誘い/手本のリズム(押し付けない)
+    if (this.sub === 'idle' && !Input.pointers.size) {
+      this.idleTimer += dt;
+      if (Mascot.state === 'idle' && this.idleTimer > CONFIG.inviteDelay) {
+        if (this.invitesIgnored >= CONFIG.demoAfterInvites) {
+          Mascot.set('demo');
+          Voice.say('みててね!');
+          this.invitesIgnored = 0;
+        } else {
+          Mascot.set('invite');
+          AudioEngine.chime();
+          if (!this.firstInviteSaid) {
+            this.firstInviteSaid = true;
+            Voice.say('ひかる ところから なぞってみて!');
+          }
+        }
+      }
+      if (Mascot.state === 'invite' && Mascot.t > 5.5) {
+        this.invitesIgnored++;
+        Mascot.set('idle');
+        this.idleTimer = CONFIG.inviteDelay * 0.35;
+      }
+    } else if (this.sub === 'tracing') {
+      this.idleTimer = 0;
+      if (Mascot.state !== 'cheer') Mascot.set('cheer');
+    }
+  },
+
+  /* ================= 描画 ================= */
+  renderWorld(ctx) {
+    const { w, h } = Screen;
+    // 夜空グラデーション
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#050718');
+    g.addColorStop(0.55, '#0a0e30');
+    g.addColorStop(1, '#1a1348');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+
+    // 星(またたき)
+    for (const s of this.stars) {
+      const tw = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(this.now * s.sp + s.ph));
+      ctx.fillStyle = s.warm ? `rgba(255,225,170,${tw})` : `rgba(200,220,255,${tw})`;
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.283); ctx.fill();
+    }
+
+    // みかづき(世界観のアクセント)
+    const mx = w * 0.85, my = h * 0.12, mr = Math.min(w, h) * 0.05;
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,236,170,0.85)';
+    ctx.beginPath(); ctx.arc(mx, my, mr, 0, 6.283); ctx.fill();
+    ctx.fillStyle = '#0a0e30';
+    ctx.beginPath(); ctx.arc(mx - mr * 0.42, my - mr * 0.18, mr * 0.86, 0, 6.283); ctx.fill();
+    ctx.restore();
+
+    if (this.state === 'boot') { this._renderBoot(ctx); return; }
+
+    River.render(ctx);
+    Mascot.render(ctx);
+    if (DEBUG) this._renderDebug(ctx);
+  },
+
+  _renderBoot(ctx) {
+    // 大きな光る星をタッチしてはじめる(文字なし)
+    const cx = Screen.w / 2, cy = Screen.h / 2;
+    const pulse = 1 + Math.sin(this.now * 2.4) * 0.12;
+    const R = Math.min(Screen.w, Screen.h) * 0.13 * pulse;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'hsla(50,80%,60%,0.07)';
+    ctx.beginPath(); ctx.arc(0, 0, R * 2.6, 0, 6.283); ctx.fill();
+    ctx.fillStyle = 'hsla(50,85%,70%,0.12)';
+    ctx.beginPath(); ctx.arc(0, 0, R * 1.7, 0, 6.283); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.rotate(this.now * 0.25);
+    ctx.fillStyle = '#ffe98f';
+    Particles._starPath(ctx, R);
+    ctx.fill();
+    ctx.restore();
+    // パルスリング
+    const pr = (this.now * 0.8) % 1;
+    ctx.strokeStyle = `hsla(50,95%,80%,${0.5 * (1 - pr)})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(cx, cy, R * (1.6 + pr * 1.6), 0, 6.283); ctx.stroke();
+  },
+
+  renderFx(ctx) {
+    // 残像フェード(透明キャンバスなので destination-out)
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = 'rgba(0,0,0,0.26)';
+    ctx.fillRect(0, 0, Screen.w, Screen.h);
+    ctx.globalCompositeOperation = 'source-over';
+
+    if (this.state !== 'play') return;
+
+    // なぞり中: 現在のインク線+次のチェックポイントの気配
+    if (this.sub === 'tracing' && Tracer.inkPoints.length > 1) {
+      const pts = Tracer.inkPoints;
+      const ink = Progress.ink();
+      const prog = Tracer.progress();
+      const hue = Tracer.inkHue(prog);
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      const from = Math.max(0, pts.length - 8);
+      ctx.beginPath();
+      ctx.moveTo(pts[from][0], pts[from][1]);
+      for (let i = from + 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+      ctx.strokeStyle = `hsla(${hue},95%,78%,0.9)`;
+      ctx.lineWidth = 6.5 * ink.trailMul;
+      ctx.stroke();
+      ctx.strokeStyle = `hsla(${hue},95%,68%,0.22)`;
+      ctx.lineWidth = 16 * ink.trailMul;
+      ctx.stroke();
+      // 次のチェックポイントがほのかに瞬く(直感的な道しるべ)
+      const s = Tracer.current();
+      if (s) {
+        for (let j = Tracer.k + 1; j <= Math.min(Tracer.k + 3, s.cps.length - 1); j++) {
+          const a = 0.5 - (j - Tracer.k) * 0.13 + Math.sin(this.now * 6 + j) * 0.1;
+          ctx.fillStyle = `hsla(52,95%,85%,${Math.max(0, a)})`;
+          ctx.beginPath(); ctx.arc(s.cps[j][0], s.cps[j][1], 4.5, 0, 6.283); ctx.fill();
+        }
+      }
+      ctx.restore();
+    }
+
+    Particles.render(ctx);
+    Fish.render(ctx);
+  },
+
+  _renderDebug(ctx) {
+    ctx.save();
+    const tune = !!window.__TUNE__;   // 字形合わせ専用表示(帯なし・フォント濃いめ)
+    // フォントの「み」を重ねて字形合わせ
+    const gsize = Screen.glyph.size;
+    ctx.globalAlpha = tune ? 0.5 : 0.35;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `${gsize}px 'IPAGothic','Hiragino Sans','Noto Sans JP',sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('み', Screen.glyph.ox + gsize / 2, Screen.glyph.oy + gsize / 2);
+    ctx.globalAlpha = 1;
+
+    const colors = ['#ff5f7a', '#39d5ff'];
+    Tracer.strokes.forEach((s, i) => {
+      // 許容帯
+      if (!tune) {
+        ctx.strokeStyle = colors[i] + '22';
+        ctx.lineWidth = Screen.tol * 2;
+        ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+        ctx.beginPath();
+        s.poly.forEach(([x, y], j) => j ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+        ctx.stroke();
+      }
+      // 中心線
+      ctx.strokeStyle = colors[i];
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      s.poly.forEach(([x, y], j) => j ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+      ctx.stroke();
+      // チェックポイント
+      s.cps.forEach(([x, y], j) => {
+        ctx.fillStyle = j === 0 ? '#ffe14d' : colors[i];
+        ctx.beginPath(); ctx.arc(x, y, j === 0 ? 6 : 2.5, 0, 6.283); ctx.fill();
+      });
+      // 制御点と番号
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+      MI_STROKES[i].points.forEach((pN, j) => {
+        const [x, y] = Screen.n2s(pN);
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(x - 2, y - 2, 4, 4);
+        ctx.fillText(`${i}-${j}`, x + 4, y - 3);
+      });
+    });
+    // 状態表示
+    ctx.fillStyle = '#9fdcff';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`state=${this.state}/${this.sub} stroke=${Tracer.strokeIndex} k=${Tracer.k} prog=${Tracer.progress().toFixed(2)} lv=${Progress.data.inkLevel} comp=${Progress.data.completions} fps~${(1/Math.max(loop.avgDt,0.001)).toFixed(0)}`,
+      10, Screen.h - 10);
+    ctx.restore();
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * boot — 初期化とメインループ
+ * ------------------------------------------------------------------- */
+const loop = {
+  last: 0, avgDt: 1 / 60, raf: 0,
+
+  tick(ts) {
+    loop.raf = requestAnimationFrame(loop.tick);
+    if (!loop.last) { loop.last = ts; return; }
+    let dt = (ts - loop.last) / 1000;
+    loop.last = ts;
+    dt = Math.min(dt, 0.033);
+    loop.avgDt = loop.avgDt * 0.95 + dt * 0.05;
+    // 負荷が高いときはパーティクル生成を自動で絞る
+    Particles.budget = Math.max(0.25, Math.min(1, Particles.budget + (0.0175 - loop.avgDt) * 2));
+
+    Game.update(dt);
+    Game.renderWorld(Screen.world);
+    Game.renderFx(Screen.fx);
+  },
+
+  start() { if (!loop.raf) loop.raf = requestAnimationFrame(loop.tick); },
+  stop() { cancelAnimationFrame(loop.raf); loop.raf = 0; loop.last = 0; },
+};
+
+function initHud() {
+  const soundBtn = document.getElementById('soundBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  soundBtn.addEventListener('pointerdown', e => {
+    e.stopPropagation();
+    AudioEngine.setMuted(!AudioEngine.muted);
+    soundBtn.textContent = AudioEngine.muted ? '🔇' : '🔊';
+  });
+  // リセットは3秒長押しの隠し操作(誤操作防止)
+  let holdTimer = 0;
+  resetBtn.addEventListener('pointerdown', e => {
+    e.stopPropagation();
+    holdTimer = setTimeout(() => {
+      Progress.reset();
+      Progress.load();
+      River.clear();
+      Tracer.restart();
+      Fish.setCount(Progress.ink().fish);
+      Game.rounds = 0;
+      Particles.burst(Screen.w / 2, Screen.h / 2, 50, 200, 300);
+      Voice.say('さいしょから!');
+    }, 3000);
+  });
+  const cancelHold = () => clearTimeout(holdTimer);
+  resetBtn.addEventListener('pointerup', cancelHold);
+  resetBtn.addEventListener('pointercancel', cancelHold);
+  resetBtn.addEventListener('pointerleave', cancelHold);
+}
+
+function boot() {
+  Screen.init();
+  Particles.init();
+  Progress.load();
+  Tracer.init();
+  River.init();
+  Fish.init(Progress.ink().fish);
+  Mascot.init();
+  Rewards.init();
+  Game.init();
+  Voice.init();
+  Input.init();
+  initHud();
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { loop.stop(); AudioEngine.suspend(); Voice.cancel(); }
+    else { loop.start(); AudioEngine.resume(); }
+  });
+
+  loop.start();
+}
+
+/* テスト・デバッグ用フック(Playwright から参照) */
+window.__MI_APP__ = {
+  CONFIG, MI_STROKES, Screen, Tracer, Game, Progress, River, Fish, Mascot,
+  // 画 i のなぞり用画面座標列(テストがこの点列でタッチをエミュレート)
+  getStrokeScreenPoints(i, spacing = 14) {
+    return Geo.resample(Screen.n2sPoly(Tracer.strokesN[i]), spacing);
+  },
+};
+
+boot();
+</script>
+</body>
+</html>
